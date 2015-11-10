@@ -66,159 +66,173 @@ by the VM (or an appliance inside a VM).
 Proposed Change
 ===============
 
-The proposal is to extend Neutron with a new first-class resource, so to
-say «trunk-port», that would be able to discriminate the VM's traffic
-by VLAN tags. The trunk port is supposed to be attached to the VM and
-receive both untagged and tagged traffic. To the trunk port can be
-attached 0 .. k Neutron ports, or «subports». The trunk port can not have
-a network attached. The subport must have a network attached. Each subport,
-being attached to a trunk port, has additional extended attributes, VID,
-VID type and parent ID, becomes «bound» and can not be attached to a VM
-directly.
+The proposal is to add a subport API extension.  The best way to think about
+this is that Neutron needs a method to describe a logical topology such that you
+have a regular VIF port (the parent) and that parent may also have child ports.
+These child ports are used to describe logical entities that reside behind the
+regular port.  Both the parent and child ports have all of the attributes that a
+port has today and can be created on any Neutron network.  A VLAN ID is just one
+possible encapsulation to use between the hypervisor and the guest to
+differentiate packets targeted at the regular port vs. one of the child ports.
 
-The tenant traffic that comes via trunk port to the subport from the VM,
-is being remapped — packet tags are replaced with internal Neutron ones,
-unique to the Neutron infrastructure. No tagged tenant traffic passes
-the Neutron network.
+The first part of the API extension is the logical topology portion.  First, we
+include a method to indicate that a port may have child ports.  This isn't
+strictly necessary, but is included for convenience, both in the API and for
+backend implementations.  This must be specified at port creation time and may
+not be changed.
 
-The tenant does not need any special privileges to manage its trunk or
-subports. Only admin can create and attach subports for different tenants.
+Note that all example command lines are for demonstrating the concepts.  The
+exact syntax is subject to change.
 
-Example of logical model::
+::
 
-                   +---------+
-                   | S1      |------------ N1 provider:network_type vlan
-                   | VLAN 10 |                provider:segmentation_id 102
-                   +---------+
-   +------+       /
-   |      |+---+ /
-   |      ||   |/  +---------+
-   |  VM  || T |---| S2      |------- N2 provider:network_type vlan
-   |      ||   |\  | VID: -- |           provider:segmentation_id 103
-   |      |+---+ \ +---------+
-   +------+       \
-                   +---------+
-                   | S3      |------------ N3 provider:network_type gre
-                   | VLAN 20 |                provider:segmentation_id X
-                   +---------+
+    $ neutron port-create --subport:is_parent NETWORK
 
-T = Trunk port, S1-3 = Subports, N1-3 = Networks
+Note that if a given plugin does not implement support for the subport API
+extension, it is completely safe to ignore this and implement the port as you
+normally would.  The port handles untagged traffic and should behave as usual.
+We could also update Neutron such that it rejects the request if the plugin does
+not indicate that it supports the subport API extension.
 
-In above example a VM connects to 3 Neutron networks. T is a trunk port and
-represents the NIC. T has three subports, the untagged traffic goes to S2
-and tagged to S1 and S3. On the S1 and S3 tenant tags are stripped and
-the traffic is forwarded to the Neutron network.
+The second part of the logical topology is the ability to specify that a port
+has a parent.
 
-On the other side the reverse procedure is applied, and tenant tags are
-placed back.
+::
+
+    $ neutron port-create --subport:parent_id PARENT-PORT-ID NETWORK
+
+Again, it's worth considering what happens if a plugin does not support this API
+extension.  Nova (or whatever system is using Neutron) will never bind these
+ports to a hypervisor.  That will only happen for the parent port.  If a plugin
+doesn't support this API extension, these ports will never be bound and will
+effectively be a NO-OP.  Of course, a better solution would be to just make
+Neutron reject the port creation if the plugin does not indicate that it
+supports the subport API extension.
+
+In addition to the logical topology piece, we need to define the type of
+encapsulation used between the hypervisor and VM for targeting packets to a
+logical sub-port, as well as for determing the source logical port for a packet
+arriving from the VM.  A VLAN ID is just one possible encapsulation.  There are
+cases where other encapsulation types may be used.  For example, in the SFC
+world there is talk of using several different encapsulation types as methods
+for targeting logical service chain endpoints inside of a VM.  This API could
+support modeling that.
+
+A subport has both an encapsulation type, as well as some encapsulation info.
+If the type is vlan, then the info is just an integer that represents a valid
+VLAN ID.
+
+::
+    $ neutron port-create --subport:parent_id PARENT-PORT-ID \
+    > --subport:encap_type vlan --subport:encap_info 101 NETWORK
+
+For the purposes of this proposal, "vlan" is the only accepted encap_type at
+this time.  Later proposals could define new encap types and associated
+encapsulation info.
+
+Just to reiterate, the encapsulation is a local encapsulation used between the
+VM and hypervisor only.  It has nothing to do with how the Neutron network the
+port is attached to is implemented.  It is only used to identify the source or
+destination logical port over a single VIF.
+
+Example logical model::
+
+                          +---------+
+                          | S1      |------------ N1
+                          | VLAN 10 |
+   +------+               +---------+
+   |      |              /
+   |      |+----------+ /
+   |      ||          |/  +---------+
+   |  VM  ||    P0    |---| S2      |------------ N2
+   |      || Untagged |\  | VID: 20 |
+   |      |+----------+ \ +---------+
+   |      |     |        \
+   +------+     |         +---------+
+                |         | S3      |------------ N3
+                N0        | VLAN 30 |
+                          +---------+
+
+* PO = Regular VIF port
+* S1-S3 = Sub-ports
+* N0-N3 = Networks
+
+In the above example, a VM connects to 4 Neutron networks.  P0 is a regular port
+that handles untagged traffic.  P0 has three subports, each using VLAN
+encapsulation with a different VLAN ID.  Packets targeted at a subport will be
+tagged with the appropriate VLAN ID before being sent to P0.  Packets received
+on P0 tagged with a VLAN ID associated with a sub-port will be treated as if the
+logical source was that subport and the packet will be sent to the Neutron
+network that sub-port is attached to.
 
 +---------+--------------+
 |VM sends |Frame goes to |
 +=========+==============+
-|Untagged | N2           |
+|Untagged | N0           |
 +---------+--------------+
 |VID 10   | N1           |
 +---------+--------------+
-|VID 20   | N3           |
+|VID 20   | N2           |
 +---------+--------------+
-
-Example of commands:
-
-::
-
- neutron trunk-port-create --name T
-
-Above trunk-port-create returns id of the trunk port (T-id).
-
-::
-
- neutron port-create --name S1 N1 --subport:parent_id <T-id>
- --subport:vid 10 --subport:vid_type VLAN
-
-::
-
- neutron port-create --name S2 N2 --subport:parent_id <T-id>
-
-By default the subport works with untagged (unmatched) traffic.
-
-::
-
- neutron port-create --name S3 N3 --subport:parent_id <T-id>
- --subport:vid 20 --subport:vid_type VLAN
-
-By default subports inherit the trunk-port MAC address, but this can be
-overriden, if needed.
-
-.. use :maxwidth: 240
-
-DHCP Example:
-
-.. actdiag::
-
-   actdiag {
-     send_dhcp -> t_dhcp -> n_dhcp -> dhcp ->
-     rn_dhcp -> rt_dhcp -> receive_dhcp
-     lane vm {
-       label = "VM"
-       send_dhcp [label = "Send DHCP on VLAN"];
-       receive_dhcp [label = "DHCP reveived on VLAN"];
-     }
-     lane trunk {
-       label = "Trunk port/Subport"
-       t_dhcp [label = "Convert to network_type format"];
-       rt_dhcp [label = "Convert to VLAN format"];
-     }
-     lane network {
-       label = "Neutron network"
-       n_dhcp [label = "Transmit over network"];
-       rn_dhcp [label = "Transmit over network"];
-     }
-     lane dhcp {
-       label = "DHCP Agent"
-       dhcp [label = "Reply on DHCP"];
-     }
-   }
-
+|VID 30   | N3           |
++---------+--------------+
 
 Constraints
 -----------
 
-* A trunk port has no parent and no VID.
+* A subport must have exactly one parent, a port marked as being a parent.
 
-* A subport has to have exactly one parent and it is a trunk port.
+* Every subport of a given parent should have unique VID among its
+  siblings.  Otherwise, it's not possible to properly differentiate
+  the source and destination logical port.
 
-* Every subport of a given VID type should have unique VID among its
-  siblings.
+* The parent port handles "untagged" traffic. The parent will receive all the
+  packets that do not match a sub-port, which is no different than how a regular
+  port already behaves today.  This also means that every VM has a port for
+  untagged traffic.  It doesn't necessarily have to be used though and could be
+  attached to a dummy Neutron network if desired.  You could also have a
+  security group set on the parent port to drop all incoming and outgoing
+  traffic.  A future enhancement could include the ability to create a Neutron
+  port not yet attached to a network, though it's unclear how valuable that
+  actually is.
 
-* There can be only one subport for "untagged" traffic. The subport will
-  receive all the packets that are not matched by classifiers. In the
-  general case it will be untagged packets.
+* When the parent port is bound, all the subports are marked as bound.
+  This is handled by the Neutron plugin implementing subport support.
 
-* When the trunk port is bound, all the subports are marked as bound.
-  A subport, being a normal Neutron port, can be rebound to the VM directly.
-
-* A normal user can only connect subports to its own trunk ports. Admin
-  user can connect subports to trunk ports with different owners.
+* A normal user can only connect subports to its own parent ports. Admin
+  user can connect subports to parent ports with different owners.
 
 
 Nova changes
 ------------
 
-Since the trunk port is a first class resource, Nova should be changed
-to be able to start VMs with trunk-port instead of normal port, if needed.
+No changes are required in Nova as a parent port is a regular Neutron port.
 
 Alternatives
 ------------
+
+A previous version of this proposal included a new first class resource called a
+"trunk port" instead of using a regular Neutron port as the parent.  The major
+functional difference between the two is that in this proposal, the parent port
+handles untagged traffic.  This is discussed in a bit more detail in the
+"Constraints" section.  Some benefits of going with the existing port resources
+instead of a new resource type include:
+
+* It is my gut feeling that this proposal will result in a simpler
+  implementation that requires less code, though that will have to be proven
+  with code, which I'd like to help with to help move things along.
+* No changes are required to any project that handles VIF port
+  bindings, such as Nova or Kuryr, since a parent port is just a regular Neutron
+  port resource.
 
 One alternative is to extend the port so that it can be connected to
 multiple networks directly. The main disadvantage with that is that it
 would change the port in such way that it affected other services in
 neutron that uses port information from ports connected to VMs. An example
-of this is the DHCP agent. Another benefit of using solution with trunk
-port and subports is that it probably is easier support service VMs that
+of this is the DHCP agent. Another benefit of using solution with parent
+ports and subports is that it probably is easier support service VMs that
 connect to multiple Tenants. There will be one subport on each Tenant
-network instead of one trunk port connected to networks from different
-networks.
+network instead of one port connected to networks from different networks.
 
 An option to associate the VID on the subport could be to associate it with
 the network and let the tenants decide VID per network. A drawback with
@@ -268,33 +282,13 @@ the specified network_type needs to exist in the API parameters.
 Data Model Impact
 -----------------
 
-New objects:
-
-::
-
-       +--------------+
-       |              |
-       |   TrunkPort  |
-       |              |
-       +--------------+
-              | 1
-              |
-              | N
-       +--------------+
-       | Neutron port |
-       |              |
-       |  + extended  |
-       |  attributes  |
-       +--------------+
-
-TrunkPort
-  * port_id - id of port.
-  * trunk_type - type of port, currently only trunk or unset.
-
-Neutron port
-  * parent_id - port id of parent.
-  * vid - VID used to reach attached network.
-  * vid_type - VID type (VLAN) of the tenant traffic.
+Neutron port:
+  * subport:is_parent - Indicate that a port is a parent port
+  * subport:parent_id - port id of parent.
+  * subport:encap_type - Encapsulation type for subport traffic (vlan only for
+    now)
+  * subport:encap_info - For "vlan" encap_type, a integer that represents a
+    valid VLAN ID.
 
 REST API Impact
 ---------------
@@ -305,29 +299,28 @@ Subport extended attributes for port resource
 |Attribute |Type   |Access   |Default  |Validation/ |Description          |
 |Name      |       |         |Value    |Conversion  |                     |
 +==========+=======+=========+=========+============+=====================+
-|subport:  |string |CR, all  |''       |uuid of     |ID of the trunk      |
+|subport:  |bool   |CR, all  |false    |bool        |Indicate that a port |
+|is_parent |       |         |         |            |may have child       |
+|          |       |         |         |            |subports.            |
++----------+-------+---------+---------+------------+---------------------+
+|subport:  |string |CR, all  |''       |uuid of     |ID of the parent     |
 |parent_id |(UUID) |         |         |parent      |port that subport is |
 |          |       |         |         |            |connected to.        |
 +----------+-------+---------+---------+------------+---------------------+
-|subport:  |integer|CR, all  |''       |uint or     |VID that will be     |
-|vid       |       |         |         |''          |used to access this  |
-|          |       |         |         |            |subport from trunk   |
-|          |       |         |         |            |port. VID has to be  |
-|          |       |         |         |            |unique among subport |
-|          |       |         |         |            |siblings. Empty VID  |
-|          |       |         |         |            |means unmatched      |
-|          |       |         |         |            |traffic              |
+|subport:  |integer|CR, all  |''       |uint or     |For encap_type of    |
+|encap_info|       |         |         |''          |vlan, this is the    |
+|          |       |         |         |            |VLAN id used for     |
+|          |       |         |         |            |packets to and from  |
+|          |       |         |         |            |this subport.        |
 +----------+-------+---------+---------+------------+---------------------+
-|subport:  |string |CR, all  |'VLAN'   |enum (*)    |VID type of the      |
-|vid_type  |       |         |         |            |tenant traffic that  |
-|          |       |         |         |            |will come from VM.   |
-|          |       |         |         |            |                     |
-|          |       |         |         |            |                     |
-|          |       |         |         |            |                     |
-|          |       |         |         |            |                     |
+|subport:  |string |CR, all  |'vlan'   |enum (*)    |Encapsulation type   |
+|encap_type|       |         |         |            |for packets to/from  |
+|          |       |         |         |            |the subport as they  |
+|          |       |         |         |            |pass through the     |
+|          |       |         |         |            |parent port.         |
 +----------+-------+---------+---------+------------+---------------------+
 
-(*) As the blueprint is focused on VLAN tagging, only 'VLAN' vid_type
+(*) As the blueprint is focused on VLAN tagging, only 'vlan' encap_type
 is defined here. Any extension is a subject of further separate blueprints.
 
 Security Impact
@@ -350,13 +343,19 @@ is totally up to the user to set VMs up properly.
 Performance Impact
 ------------------
 
-Performance of legacy functionality should be unaffected. Data path for non
-trunk ports are unchanged.
+The performance of existing functionality should be unaffected.  The data path
+for normal ports is unchanged.
+
+In some cases, this change may improve performance.  Without this change,
+connecting a VM to many Neutron networks required a VIF per network.  With this
+change, you could connect to 1000 Neutron networks with very little overhead vs.
+having to attach 1000 virtual interfaces to your VM before.
 
 IPv6 Impact
 -----------
 
-None. Tenants should be able to specify IPv6 address per subport.
+None.  Both parent ports and subports have all of the same attributes as Neutron
+ports do today, including IPv6 addresses if desired.
 
 Other Deployer Impact
 ---------------------
@@ -366,22 +365,12 @@ None
 Developer Impact
 ----------------
 
-Extented attributes on the Neutron port are to be used.
-
-A new first-class resource is to be provided.
-
-Requires the testing framework changes.
-
+* Extented attributes on the Neutron port are to be used.
+* Requires modifications to Neutron plugins to support this model
+* Requires development of new tests.
 
 Community Impact
 ----------------
-
-The new first-class resource, the trunk port, impacts not
-only Neutron, but Nova also, providing additional ways to
-start VM.
-
-Bound ports (subports) differ in the behaviour from normal
-ports and should not be treated as normal ports.
 
 Implementation
 ==============
@@ -391,20 +380,21 @@ Assignee(s)
 
 Kevin Benton
 Peter V. Saveliev
+Russell Bryant
 
 Work Items
 ----------
 
-* Security Groups support.
-* VLAN support.
-* Unit test.
-* Tempest test.
-* Scenario test.
+* API extension and DB schema updates
+* Unit tests for API+DB changes
+* Tempest tests for creating port topology
+* Tempest scenario test(s) for doing functional validation
+* Neutron Plugin support.
+  * networking-ovn (OVN supports this model already)
+  * ml2+ovs
 
 Dependencies
 ============
-
-[WIP] Requires Nova changes and may require ML2 changes.
 
 Testing
 =======
@@ -416,40 +406,41 @@ Tempest Tests
 
 Tempest tests to be implemented:
 
-* Create trunk ports
+* Create parent ports
 * Create subports
-* Bind trunk ports
+* Bind parent ports
 * Delete subports
-* Delete trunk ports
+* Delete parent ports
 
 Functional Tests
 ----------------
 
 Tests to be implemented:
 
-* Boot VM with one trunk port with subport for untagged traffic.
+* Boot VM with one parent port and no children.
   Verify connectivity.
-* Boot VM with one trunk port with multiple subports.
-  Verify connectivity.
-* Boot VM with multiple trunk ports and subports.
-* Add subport to running VM with trunk port.
-* Remove subport from running VM with trunk port.
-* Delete VM with trunk port including subports.
+* Boot VM with one parent port and multiple subports.
+  Verify connectivity to each logical port.
+* Boot VM with multiple parent ports and subports and verify connectivity.
+* Add subport to running VM with a parent port.
+* Remove subport from running VM with parent port.
+* Delete VM with parent port including subports.
 
 API Tests
 ---------
 
 Tests to be implemented:
 
-* Check that subport only can be connected to trunk port.
-* Check of valid port type.
+* Check that subport only can be connected to a parent port.
+* Check that an invalid encap_type is rejected
+* Check that an invalid encap_info is rejected
 
 
 Documentation Impact
 ====================
 
-The trunk port, being the first-class resource, should be
-documented. The subports behaviour should be described.
+The use of parent ports and subports should be documented as a way to create a
+logical multi-port topology using a single VIF on a VM.
 
 Possible scenarios for usecases should be provided with
 CLI examples.
